@@ -1,6 +1,7 @@
 name: Build Custom Switch Kernel with KSU, Droidspace & Docker
 
 on:
+  push:
   workflow_dispatch:
 
 jobs:
@@ -25,7 +26,7 @@ jobs:
     - name: Integrate KernelSU
       run: |
         cd kernel-src
-        curl -LSs "https://githubusercontent.com" | bash -s v0.9.5
+        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
 
     - name: Fix Missing Kconfig Dependency Error
       run: |
@@ -88,7 +89,7 @@ jobs:
 
     - name: Prepare AnyKernel3 Environment
       run: |
-        git clone https://github.com AK3
+        git clone https://github.com/osm0sis/AnyKernel3.git AK3
         cd AK3
         
         # 1. 移入刚编译完的超级内核
