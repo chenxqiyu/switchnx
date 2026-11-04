@@ -23,28 +23,75 @@ jobs:
         path: 'kernel-src'
         fetch-depth: 1
 
-    - name: Integrate KernelSU
+    - name: Integrate KernelSU-Next (kernel 4.4+)
       run: |
         cd kernel-src
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s v0.9.5
+        # 本机内核是 4.9：官方 tiann/KernelSU 最低支持 4.14，v1.0 起直接放弃 non-GKI；
+        # KernelSU-Next 明确支持 4.4~6.6 的 non-GKI 内核，且只依赖 KPROBES + EXT4_FS
+        # 做 kprobe 自动 hook，不需要改 fs/exec.c 之类的源码。
+        # 必须显式传分支名：setup.sh 带 set -eu，无 tag 时 git describe 会让脚本直接退出。
+        curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/dev/kernel/setup.sh" | bash -s dev
+        echo "--- 集成结果 ---"
+        ls -l drivers/kernelsu 2>/dev/null || true
+        grep -n "kernelsu" drivers/Makefile drivers/Kconfig || true
 
-    - name: Fix Missing Kconfig Dependency Error
+    - name: Fix Missing Kconfig Dependencies
       run: |
         cd kernel-src
-        # 创建缺失的 eqos 目录并在内部生成空的 Kconfig 文件，防止编译中断
-        mkdir -p drivers/net/ethernet/nvidia/eqos
-        touch drivers/net/ethernet/nvidia/eqos/Kconfig
-        # 另一种预防机制：如果该路径是别的写法，直接用 sed 删掉 Kconfig 里冲突的这一行
-        sed -i '/drivers\/net\/ethernet\/nvidia\/eqos\/Kconfig/d' drivers/net/ethernet/nvidia/Kconfig
+        # 该分支裁剪了部分驱动目录（如 drivers/firmware/tegra、.../nvidia/eqos），
+        # 但父级 Kconfig 里仍保留 source 引用，导致 make defconfig 抛
+        #   arch/arm64/Kconfig:1235: can't open file "drivers/firmware/tegra/Kconfig"
+        # 而直接中断。这里扫描整棵源码树的 Kconfig source 引用，
+        # 把所有"目标文件不存在"的行注释掉（一次覆盖全部，不只 tegra）。
+        python3 - <<'PY'
+        import re
+        from pathlib import Path
+
+        root = Path('.')
+        pat = re.compile(r'^\s*source\s+"?([^"\s]+)"?\s*$')
+        fixed = []
+
+        for kc in sorted(root.rglob('Kconfig*')):
+            if not kc.is_file() or '.git' in kc.parts:
+                continue
+            try:
+                lines = kc.read_text(errors='ignore').splitlines(True)
+            except OSError:
+                continue
+            changed = False
+            for i, ln in enumerate(lines):
+                m = pat.match(ln)
+                if not m:
+                    continue
+                tgt = m.group(1)
+                if '$' in tgt:          # source "arch/$SRCARCH/Kconfig" 这类动态路径跳过
+                    continue
+                if (root / tgt).exists():
+                    continue
+                lines[i] = '# [auto-fix: missing] ' + ln
+                changed = True
+                fixed.append('%s -> %s' % (kc, tgt))
+            if changed:
+                kc.write_text(''.join(lines))
+
+        print('disabled %d broken source line(s)' % len(fixed))
+        for f in fixed:
+            print('  -', f)
+        if not fixed:
+            print('(nothing to fix)')
+        PY
 
     - name: Configure Kernel for KSU, Droidspace & Docker
       run: |
         cd kernel-src
-        DEFCONFIG="arch/arm64/configs/icosa_android_defconfig"
+        DEFCONFIG="arch/arm64/configs/tegra_android_defconfig"
         
-        # === 1. KernelSU & Droidspace 核心配置 ===
+        # === 1. KernelSU-Next & Droidspace 核心配置 ===
+        echo "CONFIG_KSU=y" >> $DEFCONFIG
+        echo "CONFIG_EXT4_FS=y" >> $DEFCONFIG
         echo "CONFIG_NAMESPACES=y" >> $DEFCONFIG
         echo "CONFIG_PID_NS=y" >> $DEFCONFIG
+        echo "CONFIG_NET_NS=y" >> $DEFCONFIG
         echo "CONFIG_UTS_NS=y" >> $DEFCONFIG
         echo "CONFIG_IPC_NS=y" >> $DEFCONFIG
         echo "CONFIG_SYSVIPC=y" >> $DEFCONFIG
@@ -63,14 +110,13 @@ jobs:
         echo "CONFIG_BLK_CGROUP=y" >> $DEFCONFIG
 
         # === 3. Docker 桥接网络与 NAT 转发配置 ===
-        echo "CONFIG_VV_NET=y" >> $DEFCONFIG
+        echo "CONFIG_VETH=y" >> $DEFCONFIG
         echo "CONFIG_BRIDGE=y" >> $DEFCONFIG
         echo "CONFIG_BRIDGE_NETFILTER=y" >> $DEFCONFIG
         echo "CONFIG_NETFILTER_XT_MATCH_COMMENT=y" >> $DEFCONFIG
         echo "CONFIG_NETFILTER_XT_MATCH_BPF=y" >> $DEFCONFIG
         echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> $DEFCONFIG
         echo "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y" >> $DEFCONFIG
-        echo "CONFIG_NETFILTER_XT_MATCH_IPVS=y" >> $DEFCONFIG
         echo "CONFIG_NF_NAT=y" >> $DEFCONFIG
         echo "CONFIG_IP_NF_NAT=y" >> $DEFCONFIG
         echo "CONFIG_IP_NF_TARGET_MASQUERADE=y" >> $DEFCONFIG
@@ -84,36 +130,97 @@ jobs:
         cd kernel-src
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
-        make icosa_android_defconfig
+
+        # 该分支没有 icosa_android_defconfig，Switch(icosa/Tegra210) 用的是 tegra_android_defconfig，
+        # 若以后分支改名，这里能立刻报出来而不是让 make 抛一堆莫名的错。
+        if [ ! -f arch/arm64/configs/tegra_android_defconfig ]; then
+          echo "::error::defconfig 不存在，可用项如下："
+          ls arch/arm64/configs/
+          exit 1
+        fi
+
+        make tegra_android_defconfig
+
+        # CONFIG_KSU 依赖 KPROBES && EXT4_FS，任一不满足 conf 会静默把 KSU 丢掉。
+        # 提前拦截，免得白等一个多小时才发现根本没集成进去。
+        echo "--- KernelSU 相关配置 ---"
+        grep -E '^CONFIG_(KSU|KPROBES|EXT4_FS)=' .config || true
+        if ! grep -q '^CONFIG_KSU=y' .config; then
+          echo "::error::CONFIG_KSU 没有生效，请检查 KPROBES / EXT4_FS 依赖"
+          exit 1
+        fi
+
         make -j$(nproc) Image.gz
 
     - name: Prepare AnyKernel3 Environment
       run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git AK3
+        git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git AK3
         cd AK3
-        
-        # 1. 移入刚编译完的超级内核
+
+        # 1. 移入刚编译完的内核
         cp ../kernel-src/arch/arm64/boot/Image.gz ./Image.gz
-        
-        # 2. 修改配置以匹配 Switch 的 LNX (boot) 分区
-        sed -i 's/kernel.string=./kernel.string=Switch Custom 17.1 Kernel with KSU, Droidspace \& Docker/g' anykernel.sh
-        sed -i 's/block=\/dev\/block\/./block=\/dev\/block\/by-name\/LNX;/g' anykernel.sh
-        sed -i 's/is_slot_device=1;/is_slot_device=0;/g' anykernel.sh
-        
-        # 3. 动态注入高级 init 脚本，在手机底层解锁 Docker 必须的 cgroup 挂载点
-        cat << 'EOF' >> patch.sh
-        if [ -f ramdisk/init.rc ]; then
-          ui_print "  -> Patching init.rc for Droidspace & Docker Container..."
-          echo "" >> ramdisk/init.rc
-          echo "# Docker & Droidspace Tweak" >> ramdisk/init.rc
-          echo "on post-fs" >> ramdisk/init.rc
-          echo "    mount cgroup none /sys/fs/cgroup/cpu -o cpu" >> ramdisk/init.rc
-          echo "    mkdir /sys/fs/cgroup/memory 0750 root system" >> ramdisk/init.rc
-          echo "    mount cgroup none /sys/fs/cgroup/memory -o memory" >> ramdisk/init.rc
-        fi
+
+        # 2. 改写 anykernel.sh：新版 AK3 模板字段全部大写（BLOCK=/IS_SLOT_DEVICE=），
+        #    旧写法 sed 匹配 kernel.string=/block=/is_slot_device= 一个都命中不了，
+        #    而且 devicecheck=1 + device.name1=maguro 会在 Switch 上直接中止安装。
+        python3 - <<'PY'
+        import re, pathlib
+
+        p = pathlib.Path('anykernel.sh')
+        s = p.read_text()
+
+        def setprop(text, key, val):
+            pat = r'^%s=.*$' % re.escape(key)
+            if re.search(pat, text, re.M):
+                return re.sub(pat, '%s=%s' % (key, val), text, count=1, flags=re.M)
+            return text.replace("properties() { '\n", "properties() { '\n%s=%s\n" % (key, val), 1)
+
+        s = setprop(s, 'kernel.string', 'Switch Custom 17.1 Kernel with KSU, Droidspace & Docker')
+        s = setprop(s, 'do.devicecheck', '0')      # 关掉设备代号校验，否则刷入会 abort
+        s = setprop(s, 'do.modules', '0')
+        s = setprop(s, 'do.systemless', '1')
+        s = setprop(s, 'supported.versions', '')
+        s = setprop(s, 'supported.patchlevels', '')
+
+        # Switch 的 boot 分区是 LNX，且非 A/B
+        s = re.sub(r'^BLOCK=.*$', 'BLOCK=/dev/block/by-name/LNX;', s, count=1, flags=re.M)
+        s = re.sub(r'^IS_SLOT_DEVICE=.*$', 'IS_SLOT_DEVICE=0;', s, count=1, flags=re.M)
+
+        p.write_text(s)
+        print('--- anykernel.sh 关键字段 ---')
+        for ln in s.splitlines():
+            if re.match(r'(kernel\.string|do\.|BLOCK=|IS_SLOT_DEVICE=|device\.name1|supported\.)', ln):
+                print('   ', ln)
+        PY
+
+        # 3. Docker / Droidspace 需要的 init.rc 片段，作为 AK3 补丁文件放到 zip 根
+        cat > init.docker.rc <<'EOF'
+        # Docker & Droidspace cgroup bridge
+        # 该机型(icosa)的 cgroup v1 全部挂在 /dev/cpuctl、/dev/memcg 等，
+        # 且每个子系统只能挂载一次（重复 mount cgroup 会 EBUSY），
+        # 所以这里用 bind 把已有的挂载点映射到容器期望的 /sys/fs/cgroup 下。
+        on post-fs
+            mkdir /sys/fs/cgroup/cpu 0755 root system
+            mkdir /sys/fs/cgroup/memory 0755 root system
+            mount none /dev/cpuctl /sys/fs/cgroup/cpu bind
+            mount none /dev/memcg /sys/fs/cgroup/memory bind
         EOF
-        
-        sed -i '/# ramdisk changes/r patch.sh' anykernel.sh
+
+        # 4. patch.sh 从来不会被 AK3 执行（ak3-core.sh 里没有任何 source patch.sh 的逻辑），
+        #    改用 AK3 原生 append_file 在 dump_boot 之后把片段并进 ramdisk 的 init.rc。
+        python3 - <<'PY'
+        import re, pathlib
+
+        p = pathlib.Path('anykernel.sh')
+        s = p.read_text()
+        hook = 'append_file init.rc "docker-cgroups" init.docker.rc;'
+        if hook not in s:
+            s = re.sub(r'^(dump_boot;.*)$',
+                       r'\1\n\n# Docker & Droidspace cgroup mounts\n' + hook,
+                       s, count=1, flags=re.M)
+            p.write_text(s)
+        print('init.rc hook installed:', hook in s)
+        PY
 
     - name: Pack AnyKernel3 ZIP
       run: |
