@@ -77,70 +77,62 @@ jobs:
             print('(nothing to fix)')
         PY
 
-        # 该分支把 tegra-profiler 驱动整体删除了，但引用散落多处：
-        #   kernel/fork.c  : 无条件 #include <linux/tegra_profiler.h> + quadd_event_fork(p);
-        #   mm/mmap.c      : quadd_event_mmap(vma);
-        #   mm/mprotect.c  : quadd_event_mmap(vma);
-        # 后果先是 fatal error: tegra_profiler.h not found，补了空头文件之后又变成
-        # -Werror=implicit-function-declaration。这里统一处理：
-        #   1) 把这些 include 行和 quadd_*() 调用行注释掉
-        #      （profiler hook 没有了只是少个性能采样点，不影响内核功能）
-        #   2) 再补空 stub 头文件兜底，防止有漏网的其他 include 写法
-        grep -rl -e 'quadd_' -e 'tegra_profiler\.h' --include='*.c' --include='*.h' . 2>/dev/null > /tmp/krefs.txt || true
+        # ── tegra-profiler 头文件补齐 ────────────────────────────────────────
+        # 该分支删掉了 NVIDIA 的 tegra-profiler 驱动目录，但插桩点还在：
+        #   kernel/fork.c : #include <linux/tegra_profiler.h> + quadd_event_fork(p);
+        #   mm/mmap.c     : quadd_event_mmap(vma);
+        #   mm/mprotect.c : quadd_event_mmap(vma);
+        #
+        # 关键：NVIDIA 官方头文件（见 Modded-ArrowOS-For-Switch/
+        #   android_kernel_nvidia_linux-4.9_icosa_kernel_nvidia@lineage-17.1）
+        # 在 CONFIG_TEGRA_PROFILER 未开启时，把这 6 个 quadd_* 全部退化成
+        # 空 static inline。所以只要把等价头文件放回去，源码一行都不用改，
+        # 编译结果与官方关闭 profiler 时完全一致 —— 无需驱动目录、
+        # 也无需 uapi/linux/tegra_profiler.h。
+        mkdir -p include/linux
+        cat > include/linux/tegra_profiler.h <<'TPH'
+        /* 等价于 NVIDIA include/linux/tegra_profiler.h 的 CONFIG 关闭分支：
+         * 所有 quadd_* 挂钩退化为空操作（原驱动目录已从该分支移除）。 */
+        #ifndef __TEGRA_PROFILER_H
+        #define __TEGRA_PROFILER_H
 
-        python3 - <<'PY'
-        import re, pathlib
+        #include <linux/types.h>
 
-        pat_call = re.compile(r'^([ \t]*)(quadd_[A-Za-z0-9_]+\([^;]*\));[ \t]*$')
-        pat_inc  = re.compile(r'^([ \t]*)#[ \t]*include[ \t]*<linux/tegra_profiler\.h>.*$')
+        struct task_struct;
+        struct vm_area_struct;
 
-        refs = pathlib.Path('/tmp/krefs.txt')
-        names = refs.read_text().split() if refs.exists() else []
-        fixed = []
+        static inline void quadd_task_sched_in(struct task_struct *prev,
+                                               struct task_struct *task) { }
+        static inline void quadd_task_sched_out(struct task_struct *prev,
+                                                struct task_struct *next) { }
+        static inline void quadd_event_mmap(struct vm_area_struct *vma) { }
+        static inline void quadd_event_fork(struct task_struct *task) { }
+        static inline void quadd_event_exit(struct task_struct *task) { }
+        static inline void quadd_event_comm(struct task_struct *task, bool exec) { }
 
-        for f in names:
-            p = pathlib.Path(f)
-            if not p.is_file() or p.suffix not in ('.c', '.h'):
-                continue
-            try:
-                lines = p.read_text(errors='ignore').splitlines(True)
-            except OSError:
-                continue
-            changed = False
-            for i, ln in enumerate(lines):
-                m = pat_inc.match(ln)
-                if m:
-                    lines[i] = '%s/* [auto-fix] %s */\n' % (m.group(1), ln.strip())
-                    changed = True
-                    fixed.append('%s -> #include' % p)
-                    continue
-                m = pat_call.match(ln)
-                if m:
-                    lines[i] = '%s/* [auto-fix: tegra-profiler removed] %s; */\n' % (m.group(1), m.group(2))
-                    changed = True
-                    fixed.append('%s -> %s' % (p, m.group(2)))
-            if changed:
-                p.write_text(''.join(lines))
+        #endif /* __TEGRA_PROFILER_H */
+        TPH
+        echo "[+] wrote include/linux/tegra_profiler.h (no-op stubs, official semantics)"
 
-        print('patched %d tegra-profiler reference(s):' % len(fixed))
-        for x in fixed:
-            print('  -', x)
-        PY
-
-        if [ ! -f include/linux/tegra_profiler.h ]; then
-          cat > include/linux/tegra_profiler.h <<'STUB'
-        /* stub: tegra-profiler driver was removed from this branch,
-         * kept only to satisfy any leftover #include <linux/tegra_profiler.h> */
-        #ifndef _LINUX_TEGRA_PROFILER_H
-        #define _LINUX_TEGRA_PROFILER_H
-        #endif
-        STUB
-          echo "[+] created stub include/linux/tegra_profiler.h (fallback)"
+        # 校验：树里出现的 quadd_* 函数名必须都在上面这个头文件里定义过，
+        # 否则编译仍会撞 -Werror=implicit-function-declaration。这里提前暴露。
+        echo "--- 树中实际使用的 quadd_* 函数 ---"
+        grep -rho 'quadd_[A-Za-z0-9_]*' --include='*.c' --include='*.h' kernel/ mm/ fs/ arch/arm64/ 2>/dev/null | sort -u > /tmp/qused.txt || true
+        cat /tmp/qused.txt
+        echo "--- 逐个核对头部是否已提供空实现 ---"
+        missing=0
+        for fn in $(cat /tmp/qused.txt 2>/dev/null); do
+          if grep -q "$fn" include/linux/tegra_profiler.h; then
+            echo "  OK   $fn"
+          else
+            echo "::error::缺少 $fn 的空实现，需补进 include/linux/tegra_profiler.h"
+            missing=$((missing + 1))
+          fi
+        done
+        if [ "$missing" -gt 0 ]; then
+          echo "::error::$missing 个 quadd_* 没有空实现，提前中止（避免白跑一小时编译）"
+          exit 1
         fi
-
-        echo "--- 处理完后仍残留的 quadd_/tegra_profiler 引用（空=干净）---"
-        grep -rn -e 'quadd_' -e 'tegra_profiler\.h' --include='*.c' --include='*.h' \
-             kernel/ mm/ fs/ arch/arm64/ 2>/dev/null | grep -v 'auto-fix' | head -20 || true
         echo "--- end ---"
 
     - name: Configure Kernel for Droidspace & Docker
