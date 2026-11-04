@@ -77,10 +77,38 @@ jobs:
             print('(nothing to fix)')
         PY
 
+        # 同一类残留问题：该分支把 tegra-profiler 驱动整体删了
+        # （drivers/misc 下没有 tegra-profiler，include/linux/tegra_profiler.h 也不存在），
+        # 但 kernel/fork.c 仍无条件 #include <linux/tegra_profiler.h>，
+        # 编译直接 fatal error。补一个空 stub 头文件，不改动任何源码
+        # （fork.c 里除这行 include 外没有任何 profiler 调用）。
+        if [ ! -f include/linux/tegra_profiler.h ]; then
+          cat > include/linux/tegra_profiler.h <<'STUB'
+        /* stub: tegra-profiler driver was removed from this branch,
+         * kept only to satisfy stray #include <linux/tegra_profiler.h> */
+        #ifndef _LINUX_TEGRA_PROFILER_H
+        #define _LINUX_TEGRA_PROFILER_H
+        #endif
+        STUB
+          echo "[+] created stub include/linux/tegra_profiler.h"
+        fi
+
+        # 若还有文件真的调用了 tegra_profiler_* 接口（而不是只有 include），
+        # 空 stub 就不够了，这里提前把它们列出来，免得等到链接阶段才发现。
+        echo "--- 仍在调用 tegra_profiler_* 的源码（空=安全）---"
+        grep -rn "tegra_profiler_" --include='*.c' --include='*.h' kernel/ fs/ mm/ arch/arm64/ 2>/dev/null | grep -v "tegra_profiler\.h" | head -20 || true
+        echo "--- end ---"
+
     - name: Configure Kernel for Droidspace & Docker
       run: |
         cd kernel-src
         DEFCONFIG="arch/arm64/configs/tegra_android_defconfig"
+
+        # 该 defconfig 末尾没有换行符，直接 >> 会让第一条被拼到末行
+        # （变成 CONFIG_XXX=yCONFIG_NAMESPACES=y），导致第一条静默失效。
+        # 先补一个换行，后续追加才安全。注意：这里只是"预设值"，
+        # 真正生效以 Compile 里的 scripts/config + olddefconfig 为准。
+        printf '\n' >> "$DEFCONFIG"
 
         # === 1. 命名空间（本机原内核 CONFIG_NAMESPACES=n，容器必需）===
         echo "CONFIG_NAMESPACES=y" >> $DEFCONFIG
@@ -121,6 +149,7 @@ jobs:
         cd kernel-src
         export ARCH=arm64
         export CROSS_COMPILE=aarch64-linux-gnu-
+        set -o pipefail
 
         # 该分支没有 icosa_android_defconfig，Switch(icosa/Tegra210) 用的是 tegra_android_defconfig，
         # 若以后分支改名，这里能立刻报出来而不是让 make 抛一堆莫名的错。
@@ -130,19 +159,39 @@ jobs:
           exit 1
         fi
 
-        make tegra_android_defconfig
+        if ! make tegra_android_defconfig 2>&1 | tee /tmp/defconfig.log; then
+          echo "::error::make defconfig 失败，最后 40 行："
+          tail -40 /tmp/defconfig.log
+          exit 1
+        fi
 
-        # 容器相关配置是否真的生效（conf 对不满足依赖的符号是静默丢弃的）
-        echo "--- 容器相关配置 ---"
-        grep -E '^CONFIG_(NAMESPACES|NET_NS|PID_NS|SYSVIPC|VETH|OVERLAY_FS|MEMCG)=' .config || true
-        if ! grep -q '^CONFIG_NAMESPACES=y' .config; then
-          echo "::error::CONFIG_NAMESPACES 没有生效，容器将无法运行"
+        # 双保险：直接改已生成的 .config，再让 Kconfig 自己重算依赖。
+        # 这样不依赖"往 defconfig 文件追加"是否成功，也能正确处理
+        # NAMESPACES 这类 menuconfig 符号的 depends on (MULTIUSER / EXPERT)。
+        scripts/config \
+          --enable NAMESPACES \
+          --enable PID_NS \
+          --enable NET_NS \
+          --enable UTS_NS \
+          --enable IPC_NS \
+          --enable SYSVIPC \
+          --enable VETH \
+          --enable BRIDGE \
+          --enable OVERLAY_FS \
+          --enable MEMCG
+        if ! make olddefconfig 2>&1 | tail -20; then
+          echo "::error::make olddefconfig 失败"
           exit 1
         fi
-        if ! grep -q '^CONFIG_NET_NS=y' .config; then
-          echo "::error::CONFIG_NET_NS 没有生效，容器网络将不可用"
-          exit 1
-        fi
+
+        echo "--- 容器相关配置实际值 ---"
+        grep -E '^CONFIG_(NAMESPACES|PID_NS|NET_NS|UTS_NS|IPC_NS|SYSVIPC|VETH|BRIDGE|OVERLAY_FS|MEMCG)=' .config || true
+        for k in NAMESPACES NET_NS PID_NS OVERLAY_FS; do
+          if ! grep -q "^CONFIG_$k=y" .config; then
+            echo "::error::CONFIG_$k 没有生效（依赖未满足），容器将不可用"
+            exit 1
+          fi
+        done
 
         make -j$(nproc) Image.gz
 
