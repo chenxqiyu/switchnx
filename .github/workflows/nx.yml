@@ -1,0 +1,127 @@
+name: Build Custom Switch Kernel with KSU, Droidspace & Docker
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils crossbuild-essential-arm64 git bison flex libelf-dev cpio zip
+
+    - name: Clone Custom Switch 4.9 Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: 'makinbacon21/android_kernel_nvidia_kernel-4.9-nx'
+        ref: 'lineage-17.1-icosa-new'
+        path: 'kernel-src'
+        fetch-depth: 1
+
+    - name: Integrate KernelSU
+      run: |
+        cd kernel-src
+        curl -LSs "https://githubusercontent.com" | bash -s v0.9.5
+
+    - name: Fix Missing Kconfig Dependency Error
+      run: |
+        cd kernel-src
+        # 创建缺失的 eqos 目录并在内部生成空的 Kconfig 文件，防止编译中断
+        mkdir -p drivers/net/ethernet/nvidia/eqos
+        touch drivers/net/ethernet/nvidia/eqos/Kconfig
+        # 另一种预防机制：如果该路径是别的写法，直接用 sed 删掉 Kconfig 里冲突的这一行
+        sed -i '/drivers\/net\/ethernet\/nvidia\/eqos\/Kconfig/d' drivers/net/ethernet/nvidia/Kconfig
+
+    - name: Configure Kernel for KSU, Droidspace & Docker
+      run: |
+        cd kernel-src
+        DEFCONFIG="arch/arm64/configs/icosa_android_defconfig"
+        
+        # === 1. KernelSU & Droidspace 核心配置 ===
+        echo "CONFIG_NAMESPACES=y" >> $DEFCONFIG
+        echo "CONFIG_PID_NS=y" >> $DEFCONFIG
+        echo "CONFIG_UTS_NS=y" >> $DEFCONFIG
+        echo "CONFIG_IPC_NS=y" >> $DEFCONFIG
+        echo "CONFIG_SYSVIPC=y" >> $DEFCONFIG
+        echo "CONFIG_SYSVIPC_SYSCTL=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_HAVE_KPROBES=y" >> $DEFCONFIG
+        echo "CONFIG_KPROBE_EVENTS=y" >> $DEFCONFIG
+
+        # === 2. Docker 核心基础配置 ===
+        echo "CONFIG_CGROUP_DEVICE=y" >> $DEFCONFIG
+        echo "CONFIG_CGROUP_FREEZER=y" >> $DEFCONFIG
+        echo "CONFIG_CGROUP_PIDS=y" >> $DEFCONFIG
+        echo "CONFIG_CPUSETS=y" >> $DEFCONFIG
+        echo "CONFIG_MEMCG=y" >> $DEFCONFIG
+        echo "CONFIG_MEMCG_SWAP=y" >> $DEFCONFIG
+        echo "CONFIG_BLK_CGROUP=y" >> $DEFCONFIG
+
+        # === 3. Docker 桥接网络与 NAT 转发配置 ===
+        echo "CONFIG_VV_NET=y" >> $DEFCONFIG
+        echo "CONFIG_BRIDGE=y" >> $DEFCONFIG
+        echo "CONFIG_BRIDGE_NETFILTER=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_COMMENT=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_BPF=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_IPVS=y" >> $DEFCONFIG
+        echo "CONFIG_NF_NAT=y" >> $DEFCONFIG
+        echo "CONFIG_IP_NF_NAT=y" >> $DEFCONFIG
+        echo "CONFIG_IP_NF_TARGET_MASQUERADE=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_TARGET_REDIRECT=y" >> $DEFCONFIG
+
+        # === 4. Docker 存储驱动配置 ===
+        echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+
+    - name: Compile Custom Kernel
+      run: |
+        cd kernel-src
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+        make icosa_android_defconfig
+        make -j$(nproc) Image.gz
+
+    - name: Prepare AnyKernel3 Environment
+      run: |
+        git clone https://github.com AK3
+        cd AK3
+        
+        # 1. 移入刚编译完的超级内核
+        cp ../kernel-src/arch/arm64/boot/Image.gz ./Image.gz
+        
+        # 2. 修改配置以匹配 Switch 的 LNX (boot) 分区
+        sed -i 's/kernel.string=./kernel.string=Switch Custom 17.1 Kernel with KSU, Droidspace \& Docker/g' anykernel.sh
+        sed -i 's/block=\/dev\/block\/./block=\/dev\/block\/by-name\/LNX;/g' anykernel.sh
+        sed -i 's/is_slot_device=1;/is_slot_device=0;/g' anykernel.sh
+        
+        # 3. 动态注入高级 init 脚本，在手机底层解锁 Docker 必须的 cgroup 挂载点
+        cat << 'EOF' >> patch.sh
+        if [ -f ramdisk/init.rc ]; then
+          ui_print "  -> Patching init.rc for Droidspace & Docker Container..."
+          echo "" >> ramdisk/init.rc
+          echo "# Docker & Droidspace Tweak" >> ramdisk/init.rc
+          echo "on post-fs" >> ramdisk/init.rc
+          echo "    mount cgroup none /sys/fs/cgroup/cpu -o cpu" >> ramdisk/init.rc
+          echo "    mkdir /sys/fs/cgroup/memory 0750 root system" >> ramdisk/init.rc
+          echo "    mount cgroup none /sys/fs/cgroup/memory -o memory" >> ramdisk/init.rc
+        fi
+        EOF
+        
+        sed -i '/# ramdisk changes/r patch.sh' anykernel.sh
+
+    - name: Pack AnyKernel3 ZIP
+      run: |
+        cd AK3
+        rm -rf .git README.md patch.sh
+        zip -r9 ../AnyKernel3-Custom-Docker-Kernel.zip *
+
+    - name: Upload AnyKernel3 Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: Switch-Custom-Docker-AnyKernel3
+        path: AnyKernel3-Custom-Docker-Kernel.zip
