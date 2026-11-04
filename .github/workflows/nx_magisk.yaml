@@ -1,0 +1,229 @@
+name: Build Custom Switch Kernel (Magisk + Docker/Droidspace, No KernelSU)
+
+# 与 nx.yml 的区别：不集成 KernelSU，root 继续用设备上已有的 Magisk。
+# 因此不需要 CONFIG_KSU / CONFIG_KPROBES（KPROBES 是 KSU 的硬依赖，
+# 而本机 4.9.140 内核原本就是 KPROBES=n，关着更安全）。
+# 只编译「命名空间 + cgroup + 网络转发 + OverlayFS」这些容器必需能力。
+# 为避免和 nx.yml 同时全量重构编译两遍，这里只在自身被改动时自动触发。
+
+on:
+  push:
+    paths:
+      - '.github/workflows/nx_magisk.yaml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev xz-utils crossbuild-essential-arm64 git bison flex libelf-dev cpio zip
+
+    - name: Clone Custom Switch 4.9 Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: 'makinbacon21/android_kernel_nvidia_kernel-4.9-nx'
+        ref: 'lineage-17.1-icosa-new'
+        path: 'kernel-src'
+        fetch-depth: 1
+
+    - name: Fix Missing Kconfig Dependencies
+      run: |
+        cd kernel-src
+        # 该分支裁剪了部分驱动目录（如 drivers/firmware/tegra、.../nvidia/eqos），
+        # 但父级 Kconfig 里仍保留 source 引用，导致 make defconfig 抛
+        #   arch/arm64/Kconfig:1235: can't open file "drivers/firmware/tegra/Kconfig"
+        # 而直接中断。这里扫描整棵源码树的 Kconfig source 引用，
+        # 把所有"目标文件不存在"的行注释掉（一次覆盖全部，不只 tegra）。
+        python3 - <<'PY'
+        import re
+        from pathlib import Path
+
+        root = Path('.')
+        pat = re.compile(r'^\s*source\s+"?([^"\s]+)"?\s*$')
+        fixed = []
+
+        for kc in sorted(root.rglob('Kconfig*')):
+            if not kc.is_file() or '.git' in kc.parts:
+                continue
+            try:
+                lines = kc.read_text(errors='ignore').splitlines(True)
+            except OSError:
+                continue
+            changed = False
+            for i, ln in enumerate(lines):
+                m = pat.match(ln)
+                if not m:
+                    continue
+                tgt = m.group(1)
+                if '$' in tgt:          # source "arch/$SRCARCH/Kconfig" 这类动态路径跳过
+                    continue
+                if (root / tgt).exists():
+                    continue
+                lines[i] = '# [auto-fix: missing] ' + ln
+                changed = True
+                fixed.append('%s -> %s' % (kc, tgt))
+            if changed:
+                kc.write_text(''.join(lines))
+
+        print('disabled %d broken source line(s)' % len(fixed))
+        for f in fixed:
+            print('  -', f)
+        if not fixed:
+            print('(nothing to fix)')
+        PY
+
+    - name: Configure Kernel for Droidspace & Docker
+      run: |
+        cd kernel-src
+        DEFCONFIG="arch/arm64/configs/tegra_android_defconfig"
+
+        # === 1. 命名空间（本机原内核 CONFIG_NAMESPACES=n，容器必需）===
+        echo "CONFIG_NAMESPACES=y" >> $DEFCONFIG
+        echo "CONFIG_PID_NS=y" >> $DEFCONFIG
+        echo "CONFIG_NET_NS=y" >> $DEFCONFIG
+        echo "CONFIG_UTS_NS=y" >> $DEFCONFIG
+        echo "CONFIG_IPC_NS=y" >> $DEFCONFIG
+        echo "CONFIG_SYSVIPC=y" >> $DEFCONFIG
+        echo "CONFIG_SYSVIPC_SYSCTL=y" >> $DEFCONFIG
+
+        # === 2. Docker 核心基础配置 ===
+        echo "CONFIG_CGROUP_DEVICE=y" >> $DEFCONFIG
+        echo "CONFIG_CGROUP_FREEZER=y" >> $DEFCONFIG
+        echo "CONFIG_CGROUP_PIDS=y" >> $DEFCONFIG
+        echo "CONFIG_CPUSETS=y" >> $DEFCONFIG
+        echo "CONFIG_MEMCG=y" >> $DEFCONFIG
+        echo "CONFIG_MEMCG_SWAP=y" >> $DEFCONFIG
+        echo "CONFIG_BLK_CGROUP=y" >> $DEFCONFIG
+
+        # === 3. Docker 桥接网络与 NAT 转发配置 ===
+        echo "CONFIG_VETH=y" >> $DEFCONFIG
+        echo "CONFIG_BRIDGE=y" >> $DEFCONFIG
+        echo "CONFIG_BRIDGE_NETFILTER=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_COMMENT=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_BPF=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y" >> $DEFCONFIG
+        echo "CONFIG_NF_NAT=y" >> $DEFCONFIG
+        echo "CONFIG_IP_NF_NAT=y" >> $DEFCONFIG
+        echo "CONFIG_IP_NF_TARGET_MASQUERADE=y" >> $DEFCONFIG
+        echo "CONFIG_NETFILTER_XT_TARGET_REDIRECT=y" >> $DEFCONFIG
+
+        # === 4. Docker 存储驱动配置 ===
+        echo "CONFIG_OVERLAY_FS=y" >> $DEFCONFIG
+
+    - name: Compile Custom Kernel
+      run: |
+        cd kernel-src
+        export ARCH=arm64
+        export CROSS_COMPILE=aarch64-linux-gnu-
+
+        # 该分支没有 icosa_android_defconfig，Switch(icosa/Tegra210) 用的是 tegra_android_defconfig，
+        # 若以后分支改名，这里能立刻报出来而不是让 make 抛一堆莫名的错。
+        if [ ! -f arch/arm64/configs/tegra_android_defconfig ]; then
+          echo "::error::defconfig 不存在，可用项如下："
+          ls arch/arm64/configs/
+          exit 1
+        fi
+
+        make tegra_android_defconfig
+
+        # 容器相关配置是否真的生效（conf 对不满足依赖的符号是静默丢弃的）
+        echo "--- 容器相关配置 ---"
+        grep -E '^CONFIG_(NAMESPACES|NET_NS|PID_NS|SYSVIPC|VETH|OVERLAY_FS|MEMCG)=' .config || true
+        if ! grep -q '^CONFIG_NAMESPACES=y' .config; then
+          echo "::error::CONFIG_NAMESPACES 没有生效，容器将无法运行"
+          exit 1
+        fi
+        if ! grep -q '^CONFIG_NET_NS=y' .config; then
+          echo "::error::CONFIG_NET_NS 没有生效，容器网络将不可用"
+          exit 1
+        fi
+
+        make -j$(nproc) Image.gz
+
+    - name: Prepare AnyKernel3 Environment
+      run: |
+        git clone --depth 1 https://github.com/osm0sis/AnyKernel3.git AK3
+        cd AK3
+
+        # 1. 移入刚编译完的内核
+        cp ../kernel-src/arch/arm64/boot/Image.gz ./Image.gz
+
+        # 2. 改写 anykernel.sh：新版 AK3 模板字段全部大写（BLOCK=/IS_SLOT_DEVICE=），
+        #    旧写法 sed 匹配 kernel.string=/block=/is_slot_device= 一个都命中不了，
+        #    而且 devicecheck=1 + device.name1=maguro 会在 Switch 上直接中止安装。
+        python3 - <<'PY'
+        import re, pathlib
+
+        p = pathlib.Path('anykernel.sh')
+        s = p.read_text()
+
+        def setprop(text, key, val):
+            pat = r'^%s=.*$' % re.escape(key)
+            if re.search(pat, text, re.M):
+                return re.sub(pat, '%s=%s' % (key, val), text, count=1, flags=re.M)
+            return text.replace("properties() { '\n", "properties() { '\n%s=%s\n" % (key, val), 1)
+
+        s = setprop(s, 'kernel.string', 'Switch Custom 17.1 Kernel with Docker/Droidspace (Magisk)')
+        s = setprop(s, 'do.devicecheck', '0')      # 关掉设备代号校验，否则刷入会 abort
+        s = setprop(s, 'do.modules', '0')
+        s = setprop(s, 'do.systemless', '1')
+        s = setprop(s, 'supported.versions', '')
+        s = setprop(s, 'supported.patchlevels', '')
+
+        # Switch 的 boot 分区是 LNX，且非 A/B
+        s = re.sub(r'^BLOCK=.*$', 'BLOCK=/dev/block/by-name/LNX;', s, count=1, flags=re.M)
+        s = re.sub(r'^IS_SLOT_DEVICE=.*$', 'IS_SLOT_DEVICE=0;', s, count=1, flags=re.M)
+
+        p.write_text(s)
+        print('--- anykernel.sh 关键字段 ---')
+        for ln in s.splitlines():
+            if re.match(r'(kernel\.string|do\.|BLOCK=|IS_SLOT_DEVICE=|device\.name1|supported\.)', ln):
+                print('   ', ln)
+        PY
+
+        # 3. Docker / Droidspace 需要的 init.rc 片段，作为 AK3 补丁文件放到 zip 根
+        cat > init.docker.rc <<'EOF'
+        # Docker & Droidspace cgroup bridge
+        # 该机型(icosa)的 cgroup v1 全部挂在 /dev/cpuctl、/dev/memcg 等，
+        # 且每个子系统只能挂载一次（重复 mount cgroup 会 EBUSY），
+        # 所以这里用 bind 把已有的挂载点映射到容器期望的 /sys/fs/cgroup 下。
+        on post-fs
+            mkdir /sys/fs/cgroup/cpu 0755 root system
+            mkdir /sys/fs/cgroup/memory 0755 root system
+            mount none /dev/cpuctl /sys/fs/cgroup/cpu bind
+            mount none /dev/memcg /sys/fs/cgroup/memory bind
+        EOF
+
+        # 4. patch.sh 从来不会被 AK3 执行（ak3-core.sh 里没有任何 source patch.sh 的逻辑），
+        #    改用 AK3 原生 append_file 在 dump_boot 之后把片段并进 ramdisk 的 init.rc。
+        python3 - <<'PY'
+        import re, pathlib
+
+        p = pathlib.Path('anykernel.sh')
+        s = p.read_text()
+        hook = 'append_file init.rc "docker-cgroups" init.docker.rc;'
+        if hook not in s:
+            s = re.sub(r'^(dump_boot;.*)$',
+                       r'\1\n\n# Docker & Droidspace cgroup mounts\n' + hook,
+                       s, count=1, flags=re.M)
+            p.write_text(s)
+        print('init.rc hook installed:', hook in s)
+        PY
+
+    - name: Pack AnyKernel3 ZIP
+      run: |
+        cd AK3
+        rm -rf .git README.md patch.sh
+        zip -r9 ../AnyKernel3-Custom-Docker-Kernel-Magisk.zip *
+
+    - name: Upload AnyKernel3 Package
+      uses: actions/upload-artifact@v4
+      with:
+        name: Switch-Custom-Docker-Kernel-Magisk
+        path: AnyKernel3-Custom-Docker-Kernel-Magisk.zip
