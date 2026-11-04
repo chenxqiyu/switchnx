@@ -77,26 +77,70 @@ jobs:
             print('(nothing to fix)')
         PY
 
-        # 同一类残留问题：该分支把 tegra-profiler 驱动整体删了
-        # （drivers/misc 下没有 tegra-profiler，include/linux/tegra_profiler.h 也不存在），
-        # 但 kernel/fork.c 仍无条件 #include <linux/tegra_profiler.h>，
-        # 编译直接 fatal error。补一个空 stub 头文件，不改动任何源码
-        # （fork.c 里除这行 include 外没有任何 profiler 调用）。
+        # 该分支把 tegra-profiler 驱动整体删除了，但引用散落多处：
+        #   kernel/fork.c  : 无条件 #include <linux/tegra_profiler.h> + quadd_event_fork(p);
+        #   mm/mmap.c      : quadd_event_mmap(vma);
+        #   mm/mprotect.c  : quadd_event_mmap(vma);
+        # 后果先是 fatal error: tegra_profiler.h not found，补了空头文件之后又变成
+        # -Werror=implicit-function-declaration。这里统一处理：
+        #   1) 把这些 include 行和 quadd_*() 调用行注释掉
+        #      （profiler hook 没有了只是少个性能采样点，不影响内核功能）
+        #   2) 再补空 stub 头文件兜底，防止有漏网的其他 include 写法
+        grep -rl -e 'quadd_' -e 'tegra_profiler\.h' --include='*.c' --include='*.h' . 2>/dev/null > /tmp/krefs.txt || true
+
+        python3 - <<'PY'
+        import re, pathlib
+
+        pat_call = re.compile(r'^([ \t]*)(quadd_[A-Za-z0-9_]+\([^;]*\));[ \t]*$')
+        pat_inc  = re.compile(r'^([ \t]*)#[ \t]*include[ \t]*<linux/tegra_profiler\.h>.*$')
+
+        refs = pathlib.Path('/tmp/krefs.txt')
+        names = refs.read_text().split() if refs.exists() else []
+        fixed = []
+
+        for f in names:
+            p = pathlib.Path(f)
+            if not p.is_file() or p.suffix not in ('.c', '.h'):
+                continue
+            try:
+                lines = p.read_text(errors='ignore').splitlines(True)
+            except OSError:
+                continue
+            changed = False
+            for i, ln in enumerate(lines):
+                m = pat_inc.match(ln)
+                if m:
+                    lines[i] = '%s/* [auto-fix] %s */\n' % (m.group(1), ln.strip())
+                    changed = True
+                    fixed.append('%s -> #include' % p)
+                    continue
+                m = pat_call.match(ln)
+                if m:
+                    lines[i] = '%s/* [auto-fix: tegra-profiler removed] %s; */\n' % (m.group(1), m.group(2))
+                    changed = True
+                    fixed.append('%s -> %s' % (p, m.group(2)))
+            if changed:
+                p.write_text(''.join(lines))
+
+        print('patched %d tegra-profiler reference(s):' % len(fixed))
+        for x in fixed:
+            print('  -', x)
+        PY
+
         if [ ! -f include/linux/tegra_profiler.h ]; then
           cat > include/linux/tegra_profiler.h <<'STUB'
         /* stub: tegra-profiler driver was removed from this branch,
-         * kept only to satisfy stray #include <linux/tegra_profiler.h> */
+         * kept only to satisfy any leftover #include <linux/tegra_profiler.h> */
         #ifndef _LINUX_TEGRA_PROFILER_H
         #define _LINUX_TEGRA_PROFILER_H
         #endif
         STUB
-          echo "[+] created stub include/linux/tegra_profiler.h"
+          echo "[+] created stub include/linux/tegra_profiler.h (fallback)"
         fi
 
-        # 若还有文件真的调用了 tegra_profiler_* 接口（而不是只有 include），
-        # 空 stub 就不够了，这里提前把它们列出来，免得等到链接阶段才发现。
-        echo "--- 仍在调用 tegra_profiler_* 的源码（空=安全）---"
-        grep -rn "tegra_profiler_" --include='*.c' --include='*.h' kernel/ fs/ mm/ arch/arm64/ 2>/dev/null | grep -v "tegra_profiler\.h" | head -20 || true
+        echo "--- 处理完后仍残留的 quadd_/tegra_profiler 引用（空=干净）---"
+        grep -rn -e 'quadd_' -e 'tegra_profiler\.h' --include='*.c' --include='*.h' \
+             kernel/ mm/ fs/ arch/arm64/ 2>/dev/null | grep -v 'auto-fix' | head -20 || true
         echo "--- end ---"
 
     - name: Configure Kernel for Droidspace & Docker
