@@ -1,0 +1,11 @@
+#!/bin/sh
+# 固定输出原厂内核的版本后缀。
+#
+# 原厂内核是 4.9.140-gac6058b04336-dirty：
+#   "4.9.140" 来自 Makefile 的 VERSION/PATCHLEVEL/SUBLEVEL
+#   "-gac6058b04336-dirty" 由本脚本的 git describe 生成
+#
+# 我们是 --depth 1 clone（无 tag），git describe 只能给出 8 位 hash
+# 并且会因工作区状态多出 '+'，导致 vermagic 与原厂 .ko 不一致，
+# 系统所有模块都会拒绝加载。因此这里直接写死。
+echo "-gac6058b04336-dirty"
