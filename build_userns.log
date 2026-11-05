@@ -1,0 +1,57 @@
+=== defconfig ===
+#
+# configuration written to .config
+#
+scripts/kconfig/conf  --olddefconfig Kconfig
+#
+# configuration written to .config
+#
+=== verify ===
+CONFIG_NAMESPACES=y
+CONFIG_USER_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_TUN=y
+CONFIG_OVERLAY_FS=y
+=== build ===
+  CC      net/netfilter/xt_SECMARK.o
+  CC      net/xfrm/xfrm_algo.o
+  CC      net/netfilter/xt_TPROXY.o
+  CC      net/netfilter/xt_TCPMSS.o
+  CC      net/netfilter/xt_TRACE.o
+  CC      net/xfrm/xfrm_user.o
+  CC      net/netfilter/xt_IDLETIMER.o
+  CC      net/xfrm/xfrm_ipcomp.o
+  CC      net/netfilter/xt_addrtype.o
+  CC      net/netfilter/xt_bpf.o
+  CC      net/netfilter/xt_comment.o
+  CC      net/netfilter/xt_connlimit.o
+  CC      net/netfilter/xt_conntrack.o
+  CC      net/netfilter/xt_ecn.o
+  LD      net/xfrm/built-in.o
+  CC      net/netfilter/xt_hashlimit.o
+  CC      net/netfilter/xt_helper.o
+  CC      net/netfilter/xt_hl.o
+  CC      net/netfilter/xt_iprange.o
+  CC      net/netfilter/xt_length.o
+  CC      net/netfilter/xt_limit.o
+  CC      net/netfilter/xt_mac.o
+  CC      net/netfilter/xt_pkttype.o
+  CC      net/netfilter/xt_policy.o
+  CC      net/netfilter/xt_qtaguid_print.o
+  CC      net/netfilter/xt_qtaguid.o
+  CC      net/netfilter/xt_quota.o
+  CC      net/netfilter/xt_quota2.o
+  CC      net/netfilter/xt_socket.o
+  CC      net/netfilter/xt_state.o
+  CC      net/netfilter/xt_statistic.o
+  CC      net/netfilter/xt_string.o
+  CC      net/netfilter/xt_time.o
+  CC      net/netfilter/xt_u32.o
+  LD      net/netfilter/netfilter.o
+  LD      net/netfilter/nf_conntrack.o
+  LD      net/netfilter/nf_conntrack_h323.o
+  LD      net/netfilter/nf_nat.o
+  LD      net/netfilter/built-in.o
+  LD      net/built-in.o
+-rw-r--r-- 1 root root 11835991 11月 5日 14:35 arch/arm64/boot/Image.gz
